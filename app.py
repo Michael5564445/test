@@ -1,158 +1,138 @@
 import os
 import json
-import yaml
 import requests
-import shutil
+import yt_dlp
+from flask import Flask, request, jsonify
 from pathlib import Path
-from fastapi import FastAPI, Request
-from threading import Thread
-from datetime import datetime, timedelta
-import time
-import subprocess
+from datetime import datetime
 
-# --- Завантаження конфігу ---
-CONFIG_FILE = Path("/app/config/config.yml")
-with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
-    config = yaml.safe_load(f)
+# ========================
+# ENVIRONMENT VARIABLES
+# ========================
+UPCOMING_PATH = Path(os.environ.get("UPCOMING_PATH", "/app/Upcoming Movies"))
+LANGUAGE = os.environ.get("LANGUAGE", "uk")  # uk/en
+CHECK_INTERVAL_DAYS = int(os.environ.get("CHECK_INTERVAL_DAYS", 7))
+JSON_FILE = Path(os.environ.get("JSON_FILE", "/app/upcoming_movies.json"))
+TMDB_API_KEY = os.environ.get("TMDB_API_KEY", "")
 
-UPCOMING_FOLDER = Path(config['radarr']['upcoming_folder'])
-MISSING_JSON = Path(config['radarr']['json_file'])
-KOMETA_YAML = Path(config['radarr']['yaml_file'])
-LANG = config['radarr']['language']
-CHECK_INTERVAL_DAYS = config['radarr']['check_interval_days']
+# ========================
+# INITIALIZATION
+# ========================
+app = Flask(__name__)
+UPCOMING_PATH.mkdir(parents=True, exist_ok=True)
+if not JSON_FILE.exists():
+    with open(JSON_FILE, "w", encoding="utf-8") as f:
+        json.dump({}, f, indent=2, ensure_ascii=False)
 
-# --- FastAPI ---
-app = FastAPI()
+def log(msg):
+    print(f"[{datetime.now().isoformat()}] {msg}")
 
-# --- Допоміжні функції ---
-def sanitize_folder_name(name):
-    invalid = r'<>:"/\|?*'
-    for c in invalid:
-        name = name.replace(c, '-')
-    return name.strip()
-
-def download_file(url, dest_path):
-    try:
-        subprocess.run(['yt-dlp', '-o', str(dest_path), url], check=True)
-    except Exception as e:
-        print(f"Error downloading {url}: {e}")
-
-def load_missing_dates():
-    if not MISSING_JSON.exists():
-        return {}
-    with open(MISSING_JSON, 'r', encoding='utf-8') as f:
+def load_upcoming():
+    with open(JSON_FILE, "r", encoding="utf-8") as f:
         return json.load(f)
 
-def save_missing_dates(data):
-    with open(MISSING_JSON, 'w', encoding='utf-8') as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+def save_upcoming(data):
+    with open(JSON_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
 
-def load_kometa_yaml():
-    if not KOMETA_YAML.exists():
-        return {}
-    with open(KOMETA_YAML, 'r', encoding='utf-8') as f:
-        return yaml.safe_load(f) or {}
+def sanitize_filename(name):
+    return "".join(c if c.isalnum() or c in " ._-" else "_" for c in name)
 
-def save_kometa_yaml(data):
-    with open(KOMETA_YAML, 'w', encoding='utf-8') as f:
-        yaml.dump(data, f, allow_unicode=True)
+def get_tmdb_movie(tmdb_id):
+    url = f"https://api.themoviedb.org/3/movie/{tmdb_id}?api_key={TMDB_API_KEY}&language={LANGUAGE}"
+    resp = requests.get(url, timeout=10)
+    if resp.status_code != 200:
+        return None
+    return resp.json()
 
-def create_movie_folder(movie_title, year):
-    folder_name = sanitize_folder_name(f"{movie_title} ({year})")
-    folder_path = UPCOMING_FOLDER / folder_name
-    folder_path.mkdir(parents=True, exist_ok=True)
-    return folder_path
+def download_trailer(url, dest_path):
+    ydl_opts = {
+        "outtmpl": str(dest_path / "trailer.%(ext)s"),
+        "quiet": True,
+        "no_warnings": True,
+    }
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        ydl.download([url])
 
-def add_to_kometa(movie_title, release_date):
-    data = load_kometa_yaml()
-    data[movie_title] = release_date
-    save_kometa_yaml(data)
-
-def remove_movie(movie_title):
-    folder_name = sanitize_folder_name(movie_title)
-    folder_path = UPCOMING_FOLDER / folder_name
-    if folder_path.exists():
-        shutil.rmtree(folder_path)
-    # Remove from missing JSON
-    missing = load_missing_dates()
-    missing.pop(movie_title, None)
-    save_missing_dates(missing)
-    # Remove from Kometa YAML
-    kometa = load_kometa_yaml()
-    kometa.pop(movie_title, None)
-    save_kometa_yaml(kometa)
+def download_poster(poster_path, dest_path):
+    resp = requests.get(poster_path, stream=True, timeout=10)
+    if resp.status_code == 200:
+        with open(dest_path / "poster.jpg", "wb") as f:
+            for chunk in resp.iter_content(1024):
+                f.write(chunk)
 
 def process_movie(movie):
-    """
-    movie: dict з Radarr webhook
-    Keys: title, year, physicalRelease, trailer_url, poster_url
-    """
-    title = movie['title']
-    year = movie.get('year', '')
-    release_date = movie.get('physicalRelease')
-    trailer_url = movie.get('trailer_url')
-    poster_url = movie.get('poster_url')
+    tmdb_id = movie["tmdbId"]
+    title = movie["title"]
+    release_date_str = movie.get("physicalRelease") or movie.get("digitalRelease")
+    if not release_date_str:
+        return  # немає дати – не додаємо
 
-    now = datetime.utcnow().date()
-    release_dt = datetime.fromisoformat(release_date).date() if release_date else None
+    release_date = datetime.fromisoformat(release_date_str)
+    now = datetime.now()
+    if release_date <= now:
+        return  # фільм уже вийшов
 
-    if release_dt and release_dt > now:
-        # Створюємо папку і завантажуємо трейлер + постер
-        folder_path = create_movie_folder(title, year)
-        if trailer_url:
-            download_file(trailer_url, folder_path / f"trailer.{LANG}.mp4")
-        if poster_url:
-            download_file(poster_url, folder_path / f"poster.{LANG}.jpg")
-        add_to_kometa(title, release_dt.isoformat())
-    else:
-        # Додаємо у missing_dates
-        missing = load_missing_dates()
-        missing[title] = {
-            'year': year,
-            'trailer_url': trailer_url,
-            'poster_url': poster_url
-        }
-        save_missing_dates(missing)
+    # створюємо папку для фільму
+    folder_name = sanitize_filename(f"{title} ({release_date.year})")
+    movie_path = UPCOMING_PATH / folder_name
+    movie_path.mkdir(parents=True, exist_ok=True)
 
-def weekly_check():
-    while True:
-        missing = load_missing_dates()
-        to_remove = []
-        for title, info in missing.items():
-            release_date = info.get('physicalRelease')
-            trailer_url = info.get('trailer_url')
-            poster_url = info.get('poster_url')
-            if release_date:
-                folder_path = create_movie_folder(title, info.get('year',''))
-                if trailer_url:
-                    download_file(trailer_url, folder_path / f"trailer.{LANG}.mp4")
-                if poster_url:
-                    download_file(poster_url, folder_path / f"poster.{LANG}.jpg")
-                add_to_kometa(title, release_date)
-                to_remove.append(title)
-        # Видаляємо з missing_dates ті, що вже обробили
-        for t in to_remove:
-            missing.pop(t, None)
-        save_missing_dates(missing)
-        time.sleep(CHECK_INTERVAL_DAYS * 86400)  # Інтервал у днях
+    # TMDB info
+    tmdb_info = get_tmdb_movie(tmdb_id)
+    if not tmdb_info:
+        log(f"TMDb data not found for {title}")
+        return
 
-# --- Вебхук Radarr ---
-@app.post("/radarr/webhook")
-async def radarr_webhook(req: Request):
-    payload = await req.json()
-    event_type = payload.get('eventType')
-    movie = payload.get('movie', {})
-    if event_type == 'MovieAdded':
-        process_movie(movie)
-    elif event_type == 'MovieDownloaded':
-        remove_movie(movie.get('title'))
-    return {"status": "ok"}
+    # Завантаження постера
+    poster_url = f"https://image.tmdb.org/t/p/original{tmdb_info.get('poster_path')}"
+    download_poster(poster_url, movie_path)
 
-# --- Запуск планувальника в окремому потоці ---
-thread = Thread(target=weekly_check, daemon=True)
-thread.start()
+    # Завантаження трейлера (перший відео з TMDB або Youtube)
+    videos = tmdb_info.get("videos", {}).get("results", [])
+    trailer_url = None
+    for v in videos:
+        if v["type"] == "Trailer" and v["site"] == "YouTube" and v["iso_639_1"] == LANGUAGE:
+            trailer_url = f"https://www.youtube.com/watch?v={v['key']}"
+            break
+    if trailer_url:
+        download_trailer(trailer_url, movie_path)
 
-# --- FastAPI запуск ---
+    # Оновлюємо JSON для Kometa
+    upcoming_data = load_upcoming()
+    upcoming_data[tmdb_id] = {"title": title, "release_date": release_date_str}
+    save_upcoming(upcoming_data)
+    log(f"Added upcoming movie: {title}")
+
+# ========================
+# WEBHOOK HANDLER
+# ========================
+@app.route("/radarr/webhook", methods=["POST"])
+def radarr_webhook():
+    data = request.json
+    log(f"Webhook received: {data}")
+    tmdb_id = str(data.get("tmdbId"))
+    movie_path = UPCOMING_PATH / sanitize_filename(data.get("title", "unknown"))
+    
+    # Якщо фільм завантажено – видаляємо папку та JSON
+    if data.get("downloaded", False):
+        upcoming_data = load_upcoming()
+        if tmdb_id in upcoming_data:
+            del upcoming_data[tmdb_id]
+            save_upcoming(upcoming_data)
+            if movie_path.exists():
+                for f in movie_path.iterdir():
+                    f.unlink()
+                movie_path.rmdir()
+            log(f"Movie downloaded: {data.get('title')} – removed from upcoming")
+        return jsonify({"status": "removed"})
+    
+    # Інакше перевіряємо і додаємо
+    process_movie(data)
+    return jsonify({"status": "ok"})
+
+# ========================
+# RUN
+# ========================
 if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=config['radarr']['webhook_port'])
+    app.run(host="0.0.0.0", port=8000)
