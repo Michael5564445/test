@@ -2,13 +2,14 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# Встановлення залежностей
+# Копіюємо файли
+COPY app.py .
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
 
-# Копіюємо весь код
-COPY . .
+# Встановлюємо залежності
+RUN pip install --no-cache-dir -r requirements.txt
 
 EXPOSE 8000
 
+# Запуск FastAPI
 CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
