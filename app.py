@@ -1,238 +1,158 @@
-import asyncio
-import json
 import os
+import json
+import yaml
+import requests
 import shutil
 from pathlib import Path
-import logging
-import aiohttp
-import yaml
 from fastapi import FastAPI, Request
-import yt_dlp  # Для завантаження YouTube трейлерів
+from threading import Thread
+from datetime import datetime, timedelta
+import time
+import subprocess
 
+# --- Завантаження конфігу ---
+CONFIG_FILE = Path("/app/config/config.yml")
+with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
+    config = yaml.safe_load(f)
+
+UPCOMING_FOLDER = Path(config['radarr']['upcoming_folder'])
+MISSING_JSON = Path(config['radarr']['json_file'])
+KOMETA_YAML = Path(config['radarr']['yaml_file'])
+LANG = config['radarr']['language']
+CHECK_INTERVAL_DAYS = config['radarr']['check_interval_days']
+
+# --- FastAPI ---
 app = FastAPI()
 
-TMDB_API_KEY = os.getenv("TMDB_API_KEY")
-LANGUAGE = os.getenv("LANGUAGE", "uk")
-CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", 604800))  # 1 тиждень
-FRAME_PATH = os.getenv("FRAME_PATH")
-MOVIES_FILE = Path(os.getenv("MOVIES_FILE", "movies.json"))
-OVERLAY_FILE = Path(os.getenv("OVERLAY_FILE", "upcoming_overlays.yml"))
-UPCOMING_DIR = Path(os.getenv("UPCOMING_DIR", "Upcoming Movies"))
+# --- Допоміжні функції ---
+def sanitize_folder_name(name):
+    invalid = r'<>:"/\|?*'
+    for c in invalid:
+        name = name.replace(c, '-')
+    return name.strip()
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("upcoming_movies")
+def download_file(url, dest_path):
+    try:
+        subprocess.run(['yt-dlp', '-o', str(dest_path), url], check=True)
+    except Exception as e:
+        print(f"Error downloading {url}: {e}")
 
-UPCOMING_DIR.mkdir(parents=True, exist_ok=True)
-MOVIES_FILE.parent.mkdir(parents=True, exist_ok=True)
-if not MOVIES_FILE.exists():
-    MOVIES_FILE.write_text("[]", encoding="utf-8")
-if not OVERLAY_FILE.exists():
-    OVERLAY_FILE.write_text(json.dumps({"overlays": {}, "templates": {}}), encoding="utf-8")
+def load_missing_dates():
+    if not MISSING_JSON.exists():
+        return {}
+    with open(MISSING_JSON, 'r', encoding='utf-8') as f:
+        return json.load(f)
 
-# --- Fetch TMDb ---
-async def fetch_tmdb_movie(tmdb_id):
-    url = f"https://api.themoviedb.org/3/movie/{tmdb_id}"
-    params = {"api_key": TMDB_API_KEY, "language": LANGUAGE, "append_to_response": "videos,release_dates,images"}
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url, params=params) as r:
-            if r.status != 200:
-                logger.warning(f"TMDb API error {r.status} for movie {tmdb_id}")
-                return None
-            return await r.json()
+def save_missing_dates(data):
+    with open(MISSING_JSON, 'w', encoding='utf-8') as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
 
-# --- Fetch Blu-ray date ---
-async def fetch_bluray_date(title_eng):
-    from bs4 import BeautifulSoup
+def load_kometa_yaml():
+    if not KOMETA_YAML.exists():
+        return {}
+    with open(KOMETA_YAML, 'r', encoding='utf-8') as f:
+        return yaml.safe_load(f) or {}
 
-    search_url = f"https://www.blu-ray.com/search/?quicksearch={title_eng.replace(' ', '+')}"
-    async with aiohttp.ClientSession() as session:
-        async with session.get(search_url) as r:
-            if r.status != 200:
-                return None
-            html = await r.text()
-    soup = BeautifulSoup(html, "html.parser")
-    link = soup.select_one("td.searchTitle a")
-    if not link:
-        return None
-    movie_url = "https://www.blu-ray.com" + link["href"]
-    async with aiohttp.ClientSession() as session:
-        async with session.get(movie_url) as r:
-            if r.status != 200:
-                return None
-            html = await r.text()
-    soup = BeautifulSoup(html, "html.parser")
-    date_elem = soup.select_one("td.releaseDate")
-    if date_elem:
-        return date_elem.text.strip()
-    return None
+def save_kometa_yaml(data):
+    with open(KOMETA_YAML, 'w', encoding='utf-8') as f:
+        yaml.dump(data, f, allow_unicode=True)
 
-# --- Overlay functions ---
-def add_overlay(movie_id, release_date):
-    if OVERLAY_FILE.exists():
-        with open(OVERLAY_FILE, "r", encoding="utf-8") as f:
-            data = yaml.safe_load(f) or {"overlays": {}, "templates": {}}
+def create_movie_folder(movie_title, year):
+    folder_name = sanitize_folder_name(f"{movie_title} ({year})")
+    folder_path = UPCOMING_FOLDER / folder_name
+    folder_path.mkdir(parents=True, exist_ok=True)
+    return folder_path
+
+def add_to_kometa(movie_title, release_date):
+    data = load_kometa_yaml()
+    data[movie_title] = release_date
+    save_kometa_yaml(data)
+
+def remove_movie(movie_title):
+    folder_name = sanitize_folder_name(movie_title)
+    folder_path = UPCOMING_FOLDER / folder_name
+    if folder_path.exists():
+        shutil.rmtree(folder_path)
+    # Remove from missing JSON
+    missing = load_missing_dates()
+    missing.pop(movie_title, None)
+    save_missing_dates(missing)
+    # Remove from Kometa YAML
+    kometa = load_kometa_yaml()
+    kometa.pop(movie_title, None)
+    save_kometa_yaml(kometa)
+
+def process_movie(movie):
+    """
+    movie: dict з Radarr webhook
+    Keys: title, year, physicalRelease, trailer_url, poster_url
+    """
+    title = movie['title']
+    year = movie.get('year', '')
+    release_date = movie.get('physicalRelease')
+    trailer_url = movie.get('trailer_url')
+    poster_url = movie.get('poster_url')
+
+    now = datetime.utcnow().date()
+    release_dt = datetime.fromisoformat(release_date).date() if release_date else None
+
+    if release_dt and release_dt > now:
+        # Створюємо папку і завантажуємо трейлер + постер
+        folder_path = create_movie_folder(title, year)
+        if trailer_url:
+            download_file(trailer_url, folder_path / f"trailer.{LANG}.mp4")
+        if poster_url:
+            download_file(poster_url, folder_path / f"poster.{LANG}.jpg")
+        add_to_kometa(title, release_dt.isoformat())
     else:
-        data = {"overlays": {}, "templates": {}}
-
-    if "templates" not in data or "ExpectedRelease" not in data["templates"]:
-        data["templates"] = {
-            "ExpectedRelease": {
-                "overlay": FRAME_PATH,
-                "builder": "text",
-                "text": "<<release_date>>",
-                "horizontal_offset": 0,
-                "vertical_offset": 0,
-                "font": "Arial",
-                "font_color": "#FFFFFF",
-                "font_size": 42,
-                "back_color": "#000000AA"
-            }
+        # Додаємо у missing_dates
+        missing = load_missing_dates()
+        missing[title] = {
+            'year': year,
+            'trailer_url': trailer_url,
+            'poster_url': poster_url
         }
+        save_missing_dates(missing)
 
-    key = f"movie_{movie_id}_expected"
-    data["overlays"][key] = {
-        "template": {"name": "ExpectedRelease", "release_date": release_date},
-        "tmdb_id": movie_id
-    }
-
-    with open(OVERLAY_FILE, "w", encoding="utf-8") as f:
-        yaml.safe_dump(data, f, allow_unicode=True, sort_keys=False)
-
-def remove_overlay(movie_id):
-    if OVERLAY_FILE.exists():
-        with open(OVERLAY_FILE, "r", encoding="utf-8") as f:
-            data = yaml.safe_load(f) or {}
-        key = f"movie_{movie_id}_expected"
-        if "overlays" in data and key in data["overlays"]:
-            del data["overlays"][key]
-            with open(OVERLAY_FILE, "w", encoding="utf-8") as f:
-                yaml.safe_dump(data, f, allow_unicode=True, sort_keys=False)
-
-# --- Create / Remove upcoming folder ---
-async def download_file(url, path):
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url) as r:
-            if r.status == 200:
-                content = await r.read()
-                with open(path, "wb") as f:
-                    f.write(content)
-
-async def create_upcoming_folder(title, poster_url=None, trailer_url=None, trailer_name="trailer.mp4"):
-    folder = UPCOMING_DIR / title
-    folder.mkdir(parents=True, exist_ok=True)
-
-    if poster_url:
-        await download_file(poster_url, folder / "poster.jpg")
-
-    if trailer_url:
-        ydl_opts = {
-            "outtmpl": str(folder / trailer_name),
-            "format": "mp4",
-            "quiet": True,
-            "merge_output_format": "mp4",
-        }
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([trailer_url])
-
-    return folder
-
-def remove_upcoming_folder(title):
-    folder = UPCOMING_DIR / title
-    if folder.exists():
-        shutil.rmtree(folder)
-
-# --- Handle MovieAdded ---
-async def handle_movie_added(movie):
-    tmdb_id = movie.get("tmdbId")
-    title = movie.get("title")
-
-    tmdb_data = await fetch_tmdb_movie(tmdb_id)
-    if not tmdb_data:
-        return
-
-    title_eng = tmdb_data.get("original_title", title)
-    bluray_date = await fetch_bluray_date(title_eng) or "TBD"
-
-    add_overlay(tmdb_id, bluray_date)
-
-    poster_path = tmdb_data.get("poster_path")
-    poster_url = f"https://image.tmdb.org/t/p/original{poster_path}" if poster_path else None
-
-    trailer_url = None
-    for v in tmdb_data.get("videos", {}).get("results", []):
-        if v.get("iso_639_1") == "uk" and v.get("site") == "YouTube" and v.get("type") == "Trailer":
-            trailer_url = f"https://www.youtube.com/watch?v={v['key']}"
-            break
-
-    await create_upcoming_folder(title, poster_url, trailer_url)
-
-    with open(MOVIES_FILE, "r", encoding="utf-8") as f:
-        movies_list = json.load(f)
-    if not any(m.get("tmdbId") == tmdb_id for m in movies_list):
-        movies_list.append({"title": title, "tmdbId": tmdb_id})
-        with open(MOVIES_FILE, "w", encoding="utf-8") as f:
-            json.dump(movies_list, f, indent=2, ensure_ascii=False)
-
-# --- Scheduled check once a week ---
-async def scheduled_check():
+def weekly_check():
     while True:
-        if MOVIES_FILE.exists():
-            with open(MOVIES_FILE, "r", encoding="utf-8") as f:
-                movies = json.load(f)
-            for m in movies:
-                tmdb_id = m.get("tmdbId")
-                title = m.get("title")
-                with open(OVERLAY_FILE, "r", encoding="utf-8") as f:
-                    overlay_data = yaml.safe_load(f) or {}
-                key = f"movie_{tmdb_id}_expected"
-                overlay_entry = overlay_data.get("overlays", {}).get(key)
+        missing = load_missing_dates()
+        to_remove = []
+        for title, info in missing.items():
+            release_date = info.get('physicalRelease')
+            trailer_url = info.get('trailer_url')
+            poster_url = info.get('poster_url')
+            if release_date:
+                folder_path = create_movie_folder(title, info.get('year',''))
+                if trailer_url:
+                    download_file(trailer_url, folder_path / f"trailer.{LANG}.mp4")
+                if poster_url:
+                    download_file(poster_url, folder_path / f"poster.{LANG}.jpg")
+                add_to_kometa(title, release_date)
+                to_remove.append(title)
+        # Видаляємо з missing_dates ті, що вже обробили
+        for t in to_remove:
+            missing.pop(t, None)
+        save_missing_dates(missing)
+        time.sleep(CHECK_INTERVAL_DAYS * 86400)  # Інтервал у днях
 
-                tmdb_data = await fetch_tmdb_movie(tmdb_id)
-                if not tmdb_data:
-                    continue
-                title_eng = tmdb_data.get("original_title", title)
-                bluray_date = await fetch_bluray_date(title_eng) or "TBD"
-
-                if overlay_entry:
-                    current_date = overlay_entry.get("template", {}).get("release_date")
-                    if current_date != bluray_date:
-                        overlay_entry["template"]["release_date"] = bluray_date
-                        with open(OVERLAY_FILE, "w", encoding="utf-8") as f:
-                            yaml.safe_dump(overlay_data, f, allow_unicode=True, sort_keys=False)
-                        logger.info(f"Updated overlay for {title} with new date {bluray_date}")
-                else:
-                    add_overlay(tmdb_id, bluray_date)
-                    logger.info(f"Added overlay for {title} with date {bluray_date}")
-        await asyncio.sleep(CHECK_INTERVAL)
-
-@app.on_event("startup")
-async def startup_event():
-    asyncio.create_task(scheduled_check())
-    logger.info("Startup complete. Scheduled task running.")
-
-# --- Radarr webhook ---
-@app.post("/radarr-webhook")
+# --- Вебхук Radarr ---
+@app.post("/radarr/webhook")
 async def radarr_webhook(req: Request):
-    data = await req.json()
-    logger.info(f"Webhook received: {json.dumps(data, indent=2)}")
-    event_type = data.get("eventType")
-    movie = data.get("movie", {})
-    tmdb_id = movie.get("tmdbId")
-    title = movie.get("title")
+    payload = await req.json()
+    event_type = payload.get('eventType')
+    movie = payload.get('movie', {})
+    if event_type == 'MovieAdded':
+        process_movie(movie)
+    elif event_type == 'MovieDownloaded':
+        remove_movie(movie.get('title'))
+    return {"status": "ok"}
 
-    if event_type == "MovieAdded":
-        await handle_movie_added(movie)
-        return {"status": "processed_added"}
+# --- Запуск планувальника в окремому потоці ---
+thread = Thread(target=weekly_check, daemon=True)
+thread.start()
 
-    elif event_type in ["MovieDownloaded", "MovieDelete"]:
-        remove_upcoming_folder(title)
-        remove_overlay(tmdb_id)
-        if MOVIES_FILE.exists():
-            with open(MOVIES_FILE, "r", encoding="utf-8") as f:
-                movies_list = json.load(f)
-            movies_list = [m for m in movies_list if m.get("tmdbId") != tmdb_id]
-            with open(MOVIES_FILE, "w", encoding="utf-8") as f:
-                json.dump(movies_list, f, indent=2, ensure_ascii=False)
-        return {"status": "processed_removed"}
-
-    return {"status": "ignored"}
+# --- FastAPI запуск ---
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=config['radarr']['webhook_port'])
