@@ -6,14 +6,14 @@ import yaml
 
 app = FastAPI()
 
-# Параметри
+# --- Параметри ---
 MOVIES_FILE = Path("movies.json")
 OVERLAY_FILE = Path("kometa_config/upcoming_overlays.yml")
 UPCOMING_DIR = Path("Upcoming Movies")
 COMPOSE_DIR = Path("compose_movies")
 
 LANGUAGE = os.getenv("LANGUAGE", "uk")  # мова з Compose
-CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", 604800))  # за замовчуванням 1 тиждень
+CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", 604800))  # 1 тиждень за замовчуванням
 FRAME_PATH = "kometa_config/overlays/red_frame.png"
 
 # --- Helper функції ---
@@ -21,38 +21,38 @@ def create_upcoming_folder(title, year, poster_file, trailer_file, movie_id, rel
     folder_name = f"{title} ({year})"
     folder = UPCOMING_DIR / folder_name
     folder.mkdir(parents=True, exist_ok=True)
-    
-    # Копіюємо постер
-    if poster_file.exists():
+
+    if poster_file and poster_file.exists():
         shutil.copy2(poster_file, folder / "poster.jpg")
-    
-    # Копіюємо трейлер
-    if trailer_file.exists():
+
+    if trailer_file and trailer_file.exists():
         shutil.copy2(trailer_file, folder / trailer_file.name)
-    
-    # Додаємо overlay у YAML
+
     add_overlay(movie_id, release_date)
     return folder
 
 def add_overlay(movie_id, release_date):
-    # Читаємо або створюємо YAML
     if OVERLAY_FILE.exists():
         with open(OVERLAY_FILE, "r", encoding="utf-8") as f:
-            data = yaml.safe_load(f)
+            data = yaml.safe_load(f) or {"overlays": {}, "templates": {}}
     else:
-        data = {"overlays": {}, "templates": {
-            "ExpectedRelease": {
-                "overlay": FRAME_PATH,
-                "builder": "text",
-                "text": "<<release_date>>",
-                "horizontal_offset": 0,
-                "vertical_offset": 0,
-                "font": "Arial",
-                "font_color": "#FFFFFF",
-                "font_size": 42,
-                "back_color": "#000000AA"
-            }
-        }}
+        data = {"overlays": {}, "templates": {}}
+
+    if "templates" not in data:
+        data["templates"] = {}
+
+    if "ExpectedRelease" not in data["templates"]:
+        data["templates"]["ExpectedRelease"] = {
+            "overlay": FRAME_PATH,
+            "builder": "text",
+            "text": "<<release_date>>",
+            "horizontal_offset": 0,
+            "vertical_offset": 0,
+            "font": "Arial",
+            "font_color": "#FFFFFF",
+            "font_size": 42,
+            "back_color": "#000000AA"
+        }
 
     key = f"movie_{movie_id}_expected"
     data["overlays"][key] = {
@@ -63,15 +63,15 @@ def add_overlay(movie_id, release_date):
     with open(OVERLAY_FILE, "w", encoding="utf-8") as f:
         yaml.safe_dump(data, f, allow_unicode=True, sort_keys=False)
 
-def get_movie_files(folder_path):
-    poster = None
-    trailer = None
-    for f in folder_path.iterdir():
-        if f.is_file():
-            if f.name.lower().startswith(f"poster_{LANGUAGE}"):
-                poster = f
-            elif f.name.lower().startswith(f"trailer_{LANGUAGE}"):
-                trailer = f
+def get_movie_files(folder_path: Path):
+    poster, trailer = None, None
+    if folder_path.exists() and folder_path.is_dir():
+        for f in folder_path.iterdir():
+            if f.is_file():
+                if f.name.lower().startswith(f"poster_{LANGUAGE}"):
+                    poster = f
+                elif f.name.lower().startswith(f"trailer_{LANGUAGE}"):
+                    trailer = f
     return poster, trailer
 
 # --- Щотижнева перевірка ---
@@ -80,34 +80,50 @@ async def scheduled_check():
         if MOVIES_FILE.exists():
             with open(MOVIES_FILE, "r", encoding="utf-8") as f:
                 movies = json.load(f)
+
             updated = []
             for m in movies:
-                folder_path = COMPOSE_DIR / m["folder_name"]
+                folder_path = COMPOSE_DIR / m.get("folder_name", "")
                 poster, trailer = get_movie_files(folder_path)
                 release_date = m.get("release_date")
                 if poster and trailer and release_date:
-                    create_upcoming_folder(m["title"], m["year"], poster, trailer, m["folder_id"], release_date)
+                    create_upcoming_folder(m.get("title"), m.get("year"), poster, trailer, m.get("folder_id"), release_date)
                 else:
                     updated.append(m)
+
             with open(MOVIES_FILE, "w", encoding="utf-8") as f:
                 json.dump(updated, f, indent=2, ensure_ascii=False)
+
         await asyncio.sleep(CHECK_INTERVAL)
 
 @app.on_event("startup")
 async def startup_event():
     asyncio.create_task(scheduled_check())
 
+# --- Health check ---
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
+
 # --- Webhook Radarr ---
 @app.post("/radarr-webhook")
 async def radarr_webhook(req: Request):
-    data = await req.json()
+    try:
+        data = await req.json()
+    except Exception:
+        return {"status": "ignored", "reason": "invalid JSON"}
+
     event_type = data.get("eventType")
     movie = data.get("movie", {})
+
     folder_name = movie.get("folderName")
     movie_id = movie.get("tmdbId")
-    release_date = movie.get("physicalReleaseDate")  # вказана дата в вебхуку
+    release_date = movie.get("physicalReleaseDate")
     year = movie.get("year")
     title = movie.get("title")
+
+    if not folder_name or not movie_id:
+        return {"status": "ignored", "reason": "missing folder_name or movie_id"}
 
     folder_path = COMPOSE_DIR / folder_name
     poster, trailer = get_movie_files(folder_path)
@@ -117,11 +133,10 @@ async def radarr_webhook(req: Request):
             create_upcoming_folder(title, year, poster, trailer, movie_id, release_date)
         else:
             # Додати у JSON для подальшої перевірки
+            movies = []
             if MOVIES_FILE.exists():
                 with open(MOVIES_FILE, "r", encoding="utf-8") as f:
                     movies = json.load(f)
-            else:
-                movies = []
             if not any(m.get("folder_id") == movie_id for m in movies):
                 movies.append({
                     "folder_name": folder_name,
@@ -141,6 +156,7 @@ async def radarr_webhook(req: Request):
             shutil.rmtree(upcoming_folder)
 
         # Видалення з JSON
+        movies = []
         if MOVIES_FILE.exists():
             with open(MOVIES_FILE, "r", encoding="utf-8") as f:
                 movies = json.load(f)
@@ -151,9 +167,9 @@ async def radarr_webhook(req: Request):
         # Видалення запису з YAML
         if OVERLAY_FILE.exists():
             with open(OVERLAY_FILE, "r", encoding="utf-8") as f:
-                data = yaml.safe_load(f)
+                data = yaml.safe_load(f) or {}
             key = f"movie_{movie_id}_expected"
-            if "overlays" in data and key in data["overlays"]:
+            if "overlays" in data and key in data.get("overlays", {}):
                 del data["overlays"][key]
                 with open(OVERLAY_FILE, "w", encoding="utf-8") as f:
                     yaml.safe_dump(data, f, allow_unicode=True, sort_keys=False)
