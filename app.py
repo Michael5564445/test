@@ -34,7 +34,7 @@ if not OVERLAY_FILE.exists():
 # --- Helper ---
 async def fetch_tmdb_movie(tmdb_id):
     url = f"https://api.themoviedb.org/3/movie/{tmdb_id}"
-    params = {"api_key": TMDB_API_KEY, "language": LANGUAGE}
+    params = {"api_key": TMDB_API_KEY, "language": LANGUAGE, "append_to_response": "videos,release_dates"}
     async with aiohttp.ClientSession() as session:
         async with session.get(url, params=params) as r:
             if r.status != 200:
@@ -52,7 +52,6 @@ async def download_file(url, dest_path):
     return False
 
 async def download_trailer(youtube_url, dest_file):
-    # Переконайся, що yt-dlp встановлено в контейнері
     import subprocess
     subprocess.run(["yt-dlp", "-o", str(dest_file), youtube_url])
 
@@ -87,6 +86,16 @@ def add_overlay(movie_id, release_date):
     with open(OVERLAY_FILE, "w", encoding="utf-8") as f:
         yaml.safe_dump(data, f, allow_unicode=True, sort_keys=False)
 
+def remove_overlay(movie_id):
+    if OVERLAY_FILE.exists():
+        with open(OVERLAY_FILE, "r", encoding="utf-8") as f:
+            data = yaml.safe_load(f) or {}
+        key = f"movie_{movie_id}_expected"
+        if "overlays" in data and key in data["overlays"]:
+            del data["overlays"][key]
+            with open(OVERLAY_FILE, "w", encoding="utf-8") as f:
+                yaml.safe_dump(data, f, allow_unicode=True, sort_keys=False)
+
 def create_upcoming_folder(title, poster_file, trailer_file, movie_id, release_date):
     folder_name = f"{title}"
     folder = UPCOMING_DIR / folder_name
@@ -100,9 +109,14 @@ def create_upcoming_folder(title, poster_file, trailer_file, movie_id, release_d
     add_overlay(movie_id, release_date)
     return folder
 
+def remove_upcoming_folder(title):
+    folder = UPCOMING_DIR / title
+    if folder.exists():
+        shutil.rmtree(folder)
+
 async def handle_movie_added(movie):
     tmdb_id = movie.get("tmdbId")
-    folder_path = Path(movie.get("folderPath", ""))
+    folder_path = Path(movie.get("folderPath", UPCOMING_DIR / movie.get("title", "Unknown")))
     title = movie.get("title")
 
     tmdb_data = await fetch_tmdb_movie(tmdb_id)
@@ -112,13 +126,13 @@ async def handle_movie_added(movie):
     # Шукаємо фізичний реліз
     physical_release = None
     for rel in tmdb_data.get("release_dates", {}).get("results", []):
-        if rel.get("iso_3166_1") == "US":  # або своя країна
+        if rel.get("iso_3166_1") == "US":  # можна змінити на потрібну країну
             for r in rel.get("release_dates", []):
                 if r.get("type") == 5:  # Physical
                     physical_release = r.get("release_date")
                     break
     if not physical_release:
-        # Додати до JSON для відстеження
+        # Додаємо у JSON для відстеження
         with open(MOVIES_FILE, "r", encoding="utf-8") as f:
             movies_list = json.load(f)
         if not any(m.get("tmdbId") == tmdb_id for m in movies_list):
@@ -132,34 +146,43 @@ async def handle_movie_added(movie):
         return
 
     # Завантажуємо постер
-    poster_url = tmdb_data.get("poster_path")
+    poster_path = tmdb_data.get("poster_path")
     poster_file = folder_path / f"poster_{LANGUAGE}.jpg"
-    if poster_url:
-        await download_file(f"https://image.tmdb.org/t/p/original{poster_url}", poster_file)
+    if poster_path:
+        await download_file(f"https://image.tmdb.org/t/p/original{poster_path}", poster_file)
 
     # Завантажуємо трейлер
     videos = tmdb_data.get("videos", {}).get("results", [])
     trailer_url = None
     for v in videos:
-        if v["type"] == "Trailer" and v["site"] == "YouTube" and v["iso_639_1"] == LANGUAGE:
+        if v["type"] == "Trailer" and v["site"] == "YouTube" and v.get("iso_639_1") == LANGUAGE:
             trailer_url = f"https://www.youtube.com/watch?v={v['key']}"
             break
     trailer_file = folder_path / f"trailer_{LANGUAGE}.mp4"
     if trailer_url:
         await download_trailer(trailer_url, trailer_file)
 
+    # Створюємо папку і оверлей
     create_upcoming_folder(title, poster_file, trailer_file, tmdb_id, physical_release)
+
+    # Після додавання оверлею видаляємо з JSON
+    if MOVIES_FILE.exists():
+        with open(MOVIES_FILE, "r", encoding="utf-8") as f:
+            movies_list = json.load(f)
+        movies_list = [m for m in movies_list if m.get("tmdbId") != tmdb_id]
+        with open(MOVIES_FILE, "w", encoding="utf-8") as f:
+            json.dump(movies_list, f, indent=2, ensure_ascii=False)
 
 async def scheduled_check():
     while True:
         if MOVIES_FILE.exists():
             with open(MOVIES_FILE, "r", encoding="utf-8") as f:
                 movies = json.load(f)
-            updated = []
             for m in movies:
-                await handle_movie_added(m)
-                # видаляємо зі списку після обробки
-            # Записати оновлений список, якщо потрібен
+                try:
+                    await handle_movie_added(m)
+                except Exception as e:
+                    logger.error(f"Error handling scheduled movie {m.get('title')}: {e}")
         await asyncio.sleep(CHECK_INTERVAL)
 
 @app.on_event("startup")
@@ -174,32 +197,23 @@ async def radarr_webhook(req: Request):
     event_type = data.get("eventType")
     movie = data.get("movie", {})
 
+    tmdb_id = movie.get("tmdbId")
+    title = movie.get("title")
+
     if event_type == "MovieAdded":
         await handle_movie_added(movie)
         return {"status": "processed_added"}
+
     elif event_type in ["MovieDownloaded", "MovieDelete"]:
-        title = movie.get("title")
-        year = movie.get("year")
-        tmdb_id = movie.get("tmdbId")
-        folder = UPCOMING_DIR / f"{title}"
-        if folder.exists():
-            shutil.rmtree(folder)
-        # Видалення з JSON
+        remove_upcoming_folder(title)
+        remove_overlay(tmdb_id)
+        # Видалення з JSON, якщо ще залишилось
         if MOVIES_FILE.exists():
             with open(MOVIES_FILE, "r", encoding="utf-8") as f:
                 movies_list = json.load(f)
             movies_list = [m for m in movies_list if m.get("tmdbId") != tmdb_id]
             with open(MOVIES_FILE, "w", encoding="utf-8") as f:
                 json.dump(movies_list, f, indent=2, ensure_ascii=False)
-        # Видалення з YAML
-        if OVERLAY_FILE.exists():
-            with open(OVERLAY_FILE, "r", encoding="utf-8") as f:
-                data = yaml.safe_load(f) or {}
-            key = f"movie_{tmdb_id}_expected"
-            if "overlays" in data and key in data["overlays"]:
-                del data["overlays"][key]
-                with open(OVERLAY_FILE, "w", encoding="utf-8") as f:
-                    yaml.safe_dump(data, f, allow_unicode=True, sort_keys=False)
         return {"status": "processed_removed"}
 
     return {"status": "ignored"}
