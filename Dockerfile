@@ -1,29 +1,30 @@
 FROM python:3.11-slim
 
-# --- Змінні середовища для локального користування ---
+# --- Змінні середовища ---
 ENV PYTHONUNBUFFERED=1
 WORKDIR /app
 
-# --- Встановлюємо залежності системні ---
-RUN apt-get update && apt-get install -y \
+# --- Системні залежності ---
+RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     curl \
     wget \
     git \
     && rm -rf /var/lib/apt/lists/*
 
-# --- Встановлюємо yt-dlp ---
+# --- Встановлення yt-dlp ---
 RUN pip install --no-cache-dir yt-dlp
 
-# --- Копіюємо файли додатку ---
+# --- Копіюємо код додатку ---
 COPY app.py .
 COPY requirements.txt .
 
-# --- Встановлюємо Python-залежності ---
+# --- Встановлення Python-залежностей ---
 RUN pip install --no-cache-dir -r requirements.txt
 
-# --- Порт FastAPI ---
+# --- Відкриваємо порт для FastAPI ---
 EXPOSE 8000
 
 # --- Запуск FastAPI ---
 CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
+
