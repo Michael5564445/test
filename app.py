@@ -2,9 +2,10 @@ import os
 import json
 import requests
 import yt_dlp
-from flask import Flask, request, jsonify
 from pathlib import Path
 from datetime import datetime
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
 
 # ========================
 # ENVIRONMENT VARIABLES
@@ -18,7 +19,7 @@ TMDB_API_KEY = os.environ.get("TMDB_API_KEY", "")
 # ========================
 # INITIALIZATION
 # ========================
-app = Flask(__name__)
+app = FastAPI()
 UPCOMING_PATH.mkdir(parents=True, exist_ok=True)
 if not JSON_FILE.exists():
     with open(JSON_FILE, "w", encoding="utf-8") as f:
@@ -39,7 +40,7 @@ def sanitize_filename(name):
     return "".join(c if c.isalnum() or c in " ._-" else "_" for c in name)
 
 def get_tmdb_movie(tmdb_id):
-    url = f"https://api.themoviedb.org/3/movie/{tmdb_id}?api_key={TMDB_API_KEY}&language={LANGUAGE}"
+    url = f"https://api.themoviedb.org/3/movie/{tmdb_id}?api_key={TMDB_API_KEY}&language={LANGUAGE}&append_to_response=videos"
     resp = requests.get(url, timeout=10)
     if resp.status_code != 200:
         return None
@@ -73,22 +74,18 @@ def process_movie(movie):
     if release_date <= now:
         return  # фільм уже вийшов
 
-    # створюємо папку для фільму
     folder_name = sanitize_filename(f"{title} ({release_date.year})")
     movie_path = UPCOMING_PATH / folder_name
     movie_path.mkdir(parents=True, exist_ok=True)
 
-    # TMDB info
     tmdb_info = get_tmdb_movie(tmdb_id)
     if not tmdb_info:
         log(f"TMDb data not found for {title}")
         return
 
-    # Завантаження постера
     poster_url = f"https://image.tmdb.org/t/p/original{tmdb_info.get('poster_path')}"
     download_poster(poster_url, movie_path)
 
-    # Завантаження трейлера (перший відео з TMDB або Youtube)
     videos = tmdb_info.get("videos", {}).get("results", [])
     trailer_url = None
     for v in videos:
@@ -98,7 +95,6 @@ def process_movie(movie):
     if trailer_url:
         download_trailer(trailer_url, movie_path)
 
-    # Оновлюємо JSON для Kometa
     upcoming_data = load_upcoming()
     upcoming_data[tmdb_id] = {"title": title, "release_date": release_date_str}
     save_upcoming(upcoming_data)
@@ -107,14 +103,13 @@ def process_movie(movie):
 # ========================
 # WEBHOOK HANDLER
 # ========================
-@app.route("/radarr/webhook", methods=["POST"])
-def radarr_webhook():
-    data = request.json
+@app.post("/radarr/webhook")
+async def radarr_webhook(request: Request):
+    data = await request.json()
     log(f"Webhook received: {data}")
     tmdb_id = str(data.get("tmdbId"))
     movie_path = UPCOMING_PATH / sanitize_filename(data.get("title", "unknown"))
     
-    # Якщо фільм завантажено – видаляємо папку та JSON
     if data.get("downloaded", False):
         upcoming_data = load_upcoming()
         if tmdb_id in upcoming_data:
@@ -125,14 +120,7 @@ def radarr_webhook():
                     f.unlink()
                 movie_path.rmdir()
             log(f"Movie downloaded: {data.get('title')} – removed from upcoming")
-        return jsonify({"status": "removed"})
+        return JSONResponse({"status": "removed"})
     
-    # Інакше перевіряємо і додаємо
     process_movie(data)
-    return jsonify({"status": "ok"})
-
-# ========================
-# RUN
-# ========================
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8000)
+    return JSONResponse({"status": "ok"})
