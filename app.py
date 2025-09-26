@@ -1,127 +1,138 @@
 import os
 import json
-import aiohttp
+import requests
+import yt_dlp
 import asyncio
+import threading
 from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
 from pathlib import Path
 from datetime import datetime
 import uvicorn
-import yt_dlp
-import shutil
 
 # ========================
 # ENVIRONMENT VARIABLES
 # ========================
-TMDB_API_KEY = os.environ.get("TMDB_API_KEY")
-UPCOMING_PATH = Path(os.environ.get("UPCOMING_PATH", "./Upcoming"))
-JSON_FILE = Path(os.environ.get("JSON_FILE", "./upcoming_movies.json"))
-LANGUAGE = os.environ.get("LANGUAGE", "en")   # використовується для постера і трейлера
-UPDATE_INTERVAL = int(os.environ.get("UPDATE_INTERVAL", 24*3600))  # дефолт 24 години
-RELEASE_TYPE = int(os.environ.get("RELEASE_TYPE", 5))  # тип релізу (default Physical)
+UPCOMING_PATH = Path(os.environ.get("UPCOMING_PATH", "/data/movies"))
+JSON_FILE = Path(os.environ.get("JSON_FILE", "/data/upcoming_movies.json"))
+TMDB_API_KEY = os.environ.get("TMDB_API_KEY", "")
+LANGUAGE = os.environ.get("LANGUAGE", "en")  # для постера і трейлера
+RELEASE_TYPE = int(os.environ.get("RELEASE_TYPE", 5))  # який реліз шукати
+UPDATE_INTERVAL = int(os.environ.get("UPDATE_INTERVAL", 604800))  # раз на тиждень
 
 # ========================
-# INIT
+# INITIALIZATION
 # ========================
 app = FastAPI()
 UPCOMING_PATH.mkdir(parents=True, exist_ok=True)
 if not JSON_FILE.exists():
     with open(JSON_FILE, "w", encoding="utf-8") as f:
-        json.dump({}, f)
+        json.dump({}, f, indent=2, ensure_ascii=False)
 
-# ========================
-# UTILS
-# ========================
-def load_upcoming():
-    if JSON_FILE.exists():
-        with JSON_FILE.open("r", encoding="utf-8") as f:
-            return json.load(f)
-    return {}
-
-def save_upcoming(data):
-    with JSON_FILE.open("w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
 
 def log(msg):
-    print(f"[{datetime.now()}] {msg}", flush=True)
+    print(f"[{datetime.now().isoformat()}] {msg}")
 
-async def fetch_tmdb_release(tmdb_id):
-    """Шукаємо реліз у США за типом RELEASE_TYPE"""
+
+def load_upcoming():
+    with open(JSON_FILE, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def save_upcoming(data):
+    with open(JSON_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+
+
+def sanitize_filename(name):
+    return "".join(c if c.isalnum() or c in " ._-" else "_" for c in name)
+
+
+def get_tmdb_release_date(tmdb_id: str):
     url = f"https://api.themoviedb.org/3/movie/{tmdb_id}/release_dates?api_key={TMDB_API_KEY}"
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url) as resp:
-            data = await resp.json()
+    resp = requests.get(url, timeout=10)
+    if resp.status_code != 200:
+        return None
+    data = resp.json()
     for country in data.get("results", []):
         if country["iso_3166_1"] == "US":
-            for rd in country["release_dates"]:
-                if rd["type"] == RELEASE_TYPE:
-                    return rd.get("release_date")
+            for rel in country.get("release_dates", []):
+                if rel["type"] == RELEASE_TYPE and rel.get("release_date"):
+                    return rel["release_date"]
     return None
 
-async def download_file(url, path):
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url) as resp:
-            if resp.status == 200:
-                with open(path, "wb") as f:
-                    f.write(await resp.read())
 
-async def fetch_poster_and_trailer(tmdb_id, folder_path):
-    folder_path.mkdir(parents=True, exist_ok=True)
+def get_tmdb_movie(tmdb_id: str):
+    url = f"https://api.themoviedb.org/3/movie/{tmdb_id}?api_key={TMDB_API_KEY}&language={LANGUAGE}&append_to_response=videos"
+    resp = requests.get(url, timeout=10)
+    if resp.status_code != 200:
+        return None
+    return resp.json()
 
-    # ---- POSTER ----
-    url_info = f"https://api.themoviedb.org/3/movie/{tmdb_id}?api_key={TMDB_API_KEY}&language={LANGUAGE}"
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url_info) as resp:
-            info = await resp.json()
-            poster_path = info.get("poster_path")
-            if poster_path:
-                poster_url = f"https://image.tmdb.org/t/p/original{poster_path}"
-                await download_file(poster_url, folder_path / "poster.jpg")
 
-    # ---- TRAILER ----
-    trailer_api = f"https://api.themoviedb.org/3/movie/{tmdb_id}/videos?api_key={TMDB_API_KEY}&language={LANGUAGE}"
-    async with aiohttp.ClientSession() as session:
-        async with session.get(trailer_api) as resp:
-            data = await resp.json()
-            trailer = next((v for v in data.get("results", []) if v["type"].lower() == "trailer" and v["site"] == "YouTube"), None)
-            if trailer:
-                trailer_url = f"https://www.youtube.com/watch?v={trailer['key']}"
-                trailer_path = folder_path / "trailer.mp4"
-                ydl_opts = {"outtmpl": str(trailer_path)}
-                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                    ydl.download([trailer_url])
+def download_trailer(url, dest_path):
+    ydl_opts = {
+        "outtmpl": str(dest_path / "trailer.%(ext)s"),
+        "quiet": True,
+        "no_warnings": True,
+        "format": "bestvideo+bestaudio/best",  # оригінал
+    }
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        ydl.download([url])
 
-# ========================
-# PROCESS MOVIE
-# ========================
-async def process_movie(movie):
-    tmdb_id = str(movie["tmdbId"])
-    title = movie["title"]
 
-    release_date = await fetch_tmdb_release(tmdb_id)
+def download_poster(poster_url, dest_path):
+    resp = requests.get(poster_url, stream=True, timeout=10)
+    if resp.status_code == 200:
+        with open(dest_path / "poster.jpg", "wb") as f:
+            for chunk in resp.iter_content(1024):
+                f.write(chunk)
+
+
+def process_movie(movie):
+    tmdb_id = str(movie.get("tmdbId"))
+    title = movie.get("title")
+
+    release_date_str = get_tmdb_release_date(tmdb_id)
 
     upcoming_data = load_upcoming()
-    upcoming_data[tmdb_id] = {
-        "title": title,
-        "release_date": release_date,
-        "language": LANGUAGE,
-    }
+    upcoming_data[tmdb_id] = {"title": title, "release_date": release_date_str}
     save_upcoming(upcoming_data)
 
-    if not release_date:
-        log(f"Немає дати релізу для {title}, лише збережено у json")
+    if not release_date_str:
+        log(f"No release date for {title}, skipping folder creation")
         return
 
-    release_date = datetime.fromisoformat(release_date.replace("Z", "+00:00"))
-    now = datetime.now(datetime.utcnow().astimezone().tzinfo)
+    release_date = datetime.fromisoformat(release_date_str.replace("Z", "+00:00"))
+    now = datetime.now(datetime.utc).astimezone()
     if release_date <= now:
-        log(f"{title} вже вийшов — пропускаю")
+        log(f"{title} already released, skipping folder creation")
         return
 
-    folder_name = f"{title} ({release_date.year})"
-    folder_path = UPCOMING_PATH / folder_name
-    await fetch_poster_and_trailer(tmdb_id, folder_path)
+    folder_name = sanitize_filename(f"{title} ({release_date.year})")
+    movie_path = UPCOMING_PATH / folder_name
+    movie_path.mkdir(parents=True, exist_ok=True)
 
-    log(f"Фільм {title} оброблено, постер і трейлер збережено мовою {LANGUAGE}")
+    tmdb_info = get_tmdb_movie(tmdb_id)
+    if not tmdb_info:
+        log(f"TMDb data not found for {title}")
+        return
+
+    if tmdb_info.get("poster_path"):
+        poster_url = f"https://image.tmdb.org/t/p/original{tmdb_info['poster_path']}"
+        download_poster(poster_url, movie_path)
+
+    videos = tmdb_info.get("videos", {}).get("results", [])
+    trailer_url = None
+    for v in videos:
+        if v["type"] == "Trailer" and v["site"] == "YouTube" and v["iso_639_1"] == LANGUAGE:
+            trailer_url = f"https://www.youtube.com/watch?v={v['key']}"
+            break
+    if trailer_url:
+        download_trailer(trailer_url, movie_path)
+
+    log(f"Upcoming movie processed: {title}")
+
 
 # ========================
 # WEBHOOK HANDLER
@@ -129,55 +140,60 @@ async def process_movie(movie):
 @app.post("/radarr/webhook")
 async def radarr_webhook(request: Request):
     data = await request.json()
-    log(f"Webhook отримано: {data}")
-
-    movie = data.get("movie", {})
-    tmdb_id = str(movie.get("tmdbId"))
-    title = movie.get("title")
+    log(f"Webhook received: {data}")
 
     event_type = data.get("eventType")
+    movie = data.get("movie", {})
+    tmdb_id = str(movie.get("tmdbId"))
+    title = movie.get("title", "unknown")
 
-    # якщо файл завантажено або видалено
-    if event_type in ("Download", "MovieDelete", "MovieFileDelete"):
+    if event_type in ["Download", "MovieDownloaded", "MovieDelete"]:
         upcoming_data = load_upcoming()
         if tmdb_id in upcoming_data:
             del upcoming_data[tmdb_id]
             save_upcoming(upcoming_data)
 
-        # видаляємо папку
-        for folder in UPCOMING_PATH.iterdir():
-            if folder.is_dir() and folder.name.startswith(title):
-                shutil.rmtree(folder, ignore_errors=True)
-                log(f"Видалено {title} з json і папки")
-        return {"status": "removed"}
+        folder_name = sanitize_filename(f"{title} ({movie.get('year')})")
+        movie_path = UPCOMING_PATH / folder_name
+        if movie_path.exists():
+            for f in movie_path.iterdir():
+                f.unlink()
+            movie_path.rmdir()
+        log(f"Movie removed: {title}")
+        return JSONResponse({"status": "removed"})
 
-    # інакше додаємо фільм
     if event_type == "MovieAdded":
-        await process_movie(movie)
-        return {"status": "added"}
+        process_movie(movie)
+        return JSONResponse({"status": "ok"})
 
-    return {"status": "ignored"}
+    return JSONResponse({"status": "ignored"})
+
 
 # ========================
-# BACKGROUND TASK: перевірка дат раз у інтервал
+# BACKGROUND TASK
 # ========================
-async def periodic_update():
+async def scheduled_task():
     while True:
+        log("Scheduled check for upcoming movies...")
         upcoming_data = load_upcoming()
-        for tmdb_id, entry in list(upcoming_data.items()):
-            release_date = await fetch_tmdb_release(tmdb_id)
-            if release_date:
-                entry["release_date"] = release_date
-                log(f"Оновлено дату для {entry['title']}: {release_date}")
+        for tmdb_id, info in list(upcoming_data.items()):
+            release_date_str = get_tmdb_release_date(tmdb_id)
+            if release_date_str:
+                upcoming_data[tmdb_id]["release_date"] = release_date_str
         save_upcoming(upcoming_data)
         await asyncio.sleep(UPDATE_INTERVAL)
 
-@app.on_event("startup")
-async def startup_event():
-    asyncio.create_task(periodic_update())
+
+def start_scheduler():
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(scheduled_task())
+
+
+threading.Thread(target=start_scheduler, daemon=True).start()
 
 # ========================
-# RUN
+# AUTO RUN
 # ========================
 if __name__ == "__main__":
-    uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run("app:app", host="0.0.0.0", port=8000)
