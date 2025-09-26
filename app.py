@@ -7,7 +7,7 @@ import threading
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 import uvicorn
 
 # ========================
@@ -16,8 +16,8 @@ import uvicorn
 UPCOMING_PATH = Path(os.environ.get("UPCOMING_PATH", "/data/movies"))
 JSON_FILE = Path(os.environ.get("JSON_FILE", "/data/upcoming_movies.json"))
 TMDB_API_KEY = os.environ.get("TMDB_API_KEY", "")
-LANGUAGE = os.environ.get("LANGUAGE", "en")  # для постера і трейлера
-RELEASE_TYPE = int(os.environ.get("RELEASE_TYPE", 5))  # який реліз шукати
+LANGUAGE = os.environ.get("LANGUAGE", "en")  # мова постерів і трейлерів
+RELEASE_TYPE = int(os.environ.get("RELEASE_TYPE", 5))  # тип релізу
 UPDATE_INTERVAL = int(os.environ.get("UPDATE_INTERVAL", 604800))  # раз на тиждень
 
 # ========================
@@ -75,7 +75,7 @@ def download_trailer(url, dest_path):
         "outtmpl": str(dest_path / "trailer.%(ext)s"),
         "quiet": True,
         "no_warnings": True,
-        "format": "bestvideo+bestaudio/best",  # оригінал
+        "format": "bestvideo+bestaudio/best",
     }
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         ydl.download([url])
@@ -104,7 +104,7 @@ def process_movie(movie):
         return
 
     release_date = datetime.fromisoformat(release_date_str.replace("Z", "+00:00"))
-    now = datetime.now(datetime.utc).astimezone()
+    now = datetime.now(timezone.utc).astimezone()
     if release_date <= now:
         log(f"{title} already released, skipping folder creation")
         return
@@ -113,21 +113,37 @@ def process_movie(movie):
     movie_path = UPCOMING_PATH / folder_name
     movie_path.mkdir(parents=True, exist_ok=True)
 
+    # TMDb data
     tmdb_info = get_tmdb_movie(tmdb_id)
     if not tmdb_info:
         log(f"TMDb data not found for {title}")
         return
 
-    if tmdb_info.get("poster_path"):
-        poster_url = f"https://image.tmdb.org/t/p/original{tmdb_info['poster_path']}"
+    # Постер мовою LANGUAGE
+    poster_path = tmdb_info.get("poster_path")
+    if poster_path:
+        poster_url = f"https://image.tmdb.org/t/p/original{poster_path}"
         download_poster(poster_url, movie_path)
 
+    # Трейлер мовою LANGUAGE
     videos = tmdb_info.get("videos", {}).get("results", [])
     trailer_url = None
     for v in videos:
-        if v["type"] == "Trailer" and v["site"] == "YouTube" and v["iso_639_1"] == LANGUAGE:
+        if (
+            v.get("type") == "Trailer"
+            and v.get("site") == "YouTube"
+            and v.get("iso_639_1") == LANGUAGE
+        ):
             trailer_url = f"https://www.youtube.com/watch?v={v['key']}"
             break
+
+    # fallback: будь-який трейлер якщо мовного немає
+    if not trailer_url:
+        for v in videos:
+            if v.get("type") == "Trailer" and v.get("site") == "YouTube":
+                trailer_url = f"https://www.youtube.com/watch?v={v['key']}"
+                break
+
     if trailer_url:
         download_trailer(trailer_url, movie_path)
 
@@ -147,6 +163,7 @@ async def radarr_webhook(request: Request):
     tmdb_id = str(movie.get("tmdbId"))
     title = movie.get("title", "unknown")
 
+    # Видалення фільму після завантаження або видалення
     if event_type in ["Download", "MovieDownloaded", "MovieDelete"]:
         upcoming_data = load_upcoming()
         if tmdb_id in upcoming_data:
@@ -162,6 +179,7 @@ async def radarr_webhook(request: Request):
         log(f"Movie removed: {title}")
         return JSONResponse({"status": "removed"})
 
+    # Обробка нових фільмів
     if event_type == "MovieAdded":
         process_movie(movie)
         return JSONResponse({"status": "ok"})
